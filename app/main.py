@@ -20,7 +20,10 @@ from .db import (
 from .routers import admin as admin_router
 from .routers import config as config_router
 from .routers import ops as ops_router
+from .routers import sync as sync_router
 from .seed import seed_if_empty
+from . import sync_source
+from .sync_scheduler import scheduler
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -28,6 +31,7 @@ app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
 app.include_router(admin_router.router)
 app.include_router(ops_router.router)
+app.include_router(sync_router.router)
 
 
 @app.on_event("startup")
@@ -36,6 +40,9 @@ def startup() -> None:
     seed_if_empty()
     # 预热审计索引（config_audit_logs 没有 scope 列，按实际存在的索引列预热）
     query("SELECT created_at FROM config_audit_logs LIMIT 1")
+    # 模拟上游报文与同步演示实体（幂等），随后启动定时同步守护线程
+    sync_source.ensure_source_seeded()
+    scheduler.start()
 
 
 # ---------------------------------------------------------------- 基础工具

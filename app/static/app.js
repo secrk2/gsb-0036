@@ -180,6 +180,8 @@ async function bootstrap() {
     return;
   }
   $("#topnav").hidden = false;
+  // 数据同步是平台级能力：非管理员直接隐藏入口（接口侧同样强制 403）
+  $$("#topnav [data-admin-only]").forEach((a) => { a.hidden = state.user.role !== "admin"; });
   const chip = $("#user-chip");
   chip.hidden = false;
   const p = state.user.permissions || {};
@@ -212,6 +214,7 @@ function route() {
     if (parts[1]) renderConfigProfile(parts[1], parts[2] || "");
     else renderConfigList();
   } else if (parts[0] === "audit") renderAudit();
+  else if (parts[0] === "sync") renderSync();
   else if (parts[0] === "admin") renderAdmin();
   else renderConsole();
 }
@@ -2672,6 +2675,615 @@ async function openWindowModalFromHealth(app, env, onChange) {
   const envs = await api(`/api/apps/${app.id}/environments`);
   const full = envs.find((x) => x.env_key === env.environment);
   openWindowModal(app, full, onChange);
+}
+
+/* ---------------- 数据同步中心 ---------------- */
+let syncTab = "overview";
+
+const SYNC_RESULT_STYLE = {
+  created: { cls: "online", text: "新增" },
+  updated: { cls: "developing", text: "改动" },
+  unchanged: { cls: "offline", text: "无变化" },
+  conflict: { cls: "maintenance", text: "两边改动待裁决" },
+  failed: { cls: "", text: "未通过" },
+  local_deleted: { cls: "", text: "本地已删·拒收复活" },
+  upstream_deleted: { cls: "", text: "上游已删·待处理" },
+};
+
+function syncResultBadge(result, label) {
+  const s = SYNC_RESULT_STYLE[result] || { cls: "offline", text: result };
+  const extra = (result === "failed" || result === "local_deleted")
+    ? "background:#fde8e8;color:#c02f33"
+    : result === "upstream_deleted" ? "background:#fdf3d7;color:#ad7209" : "";
+  return `<span class="badge ${s.cls}" style="${extra}">${esc(label || s.text)}</span>`;
+}
+
+function fmtDuration(ms) {
+  if (ms == null) return "-";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
+async function renderSync() {
+  if (state.user.role !== "admin") {
+    $("#view").innerHTML = errorStateHtml("403", "数据同步是平台级能力（跨全部业务线），仅平台管理员可操作与查看");
+    return;
+  }
+  const view = $("#view");
+  view.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let st;
+  try {
+    st = await api("/api/sync/status");
+  } catch (e) {
+    view.innerHTML = errorStateHtml("加载失败", e.message);
+    return;
+  }
+  state.syncStatus = st;
+  const tabs = [
+    ["overview", "同步台"],
+    ["conflicts", `冲突裁决${st.pending_conflicts ? `（${st.pending_conflicts}）` : ""}`],
+    ["deletions", `上游删除${st.pending_remote_deletions ? `（${st.pending_remote_deletions}）` : ""}`],
+    ["tombstones", "本地删除记录"],
+    ["audit", "同步留痕"],
+  ];
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>数据同步</h2>
+        <div class="sub">上游周期性推送应用 / 模块 / 环境；定时按间隔跑，也可手动立刻跑一趟</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="btn-sync-reset" title="清空同步实体与队列，恢复初始演示报文">重置演示数据</button>
+        <button class="btn primary" id="btn-sync-now">⟳ 立即同步一趟</button>
+      </div>
+    </div>
+    ${st.pending_conflicts || st.pending_remote_deletions ? `
+    <div class="panel panel-pad" style="margin-bottom:14px;border-color:#f0d8a0;background:#fffaf0">
+      ${st.pending_conflicts ? `<p style="margin:0 0 ${st.pending_remote_deletions ? 8 : 0}px">
+        <span class="red-dot">有 ${st.pending_conflicts} 条两边都改过的记录待裁决</span>
+        —— 后到的不会盖掉先到的，<a href="javascript:void(0)" id="go-conflict">去裁决</a></p>` : ""}
+      ${st.pending_remote_deletions ? `<p style="margin:0">
+        <span class="red-dot">有 ${st.pending_remote_deletions} 条上游已删但本地仍挂着的记录待处理</span>
+        —— <a href="javascript:void(0)" id="go-deletion">去处理</a></p>` : ""}
+    </div>` : ""}
+    <div class="admin-tabs">
+      ${tabs.map(([k, t]) => `<button class="adm-tab ${syncTab === k ? "active" : ""}" data-st="${k}">${t}</button>`).join("")}
+    </div>
+    <div id="sync-body"><div class="empty-tip">加载中…</div></div>`;
+
+  $$(".adm-tab", view).forEach((b) => {
+    b.onclick = () => { syncTab = b.dataset.st; renderSync(); };
+  });
+  $("#btn-sync-now").onclick = () => runSyncNow();
+  $("#btn-sync-reset").onclick = () => resetSyncDemo();
+  if ($("#go-conflict")) $("#go-conflict").onclick = () => { syncTab = "conflicts"; renderSync(); };
+  if ($("#go-deletion")) $("#go-deletion").onclick = () => { syncTab = "deletions"; renderSync(); };
+
+  if (syncTab === "overview") paintSyncOverview(st);
+  else if (syncTab === "conflicts") paintSyncConflicts();
+  else if (syncTab === "deletions") paintSyncDeletions();
+  else if (syncTab === "tombstones") paintSyncTombstones();
+  else paintSyncAudit();
+}
+
+async function runSyncNow(scene) {
+  const btn = $("#btn-sync-now");
+  if (btn) { btn.disabled = true; btn.textContent = "同步执行中…"; }
+  try {
+    const r = await api("/api/sync/run", { method: "POST", body: { source_scene: scene || null } });
+    const warn = r.status === "partial";
+    toast(`同步完成：共 ${r.total} 条 · 新增 ${r.created_count} · 改动 ${r.updated_count} · `
+      + `待裁决 ${r.conflict_count} · 未通过 ${r.failed_count} · 拒收复活 ${r.local_deleted_count} · `
+      + `上游已删 ${r.upstream_deleted_count}`, warn ? "error" : "success");
+    syncTab = "overview";
+    renderSync();
+    if (warn) setTimeout(() => openRunModal(r.run_id), 300);
+  } catch (e) {
+    toast(e.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = "⟳ 立即同步一趟"; }
+  }
+}
+
+async function resetSyncDemo() {
+  openConfirmModal({
+    title: "重置同步演示数据",
+    message: "将删除所有 ext- 前缀的同步应用/模块/环境，清空运行记录、冲突、上游删除与墓碑队列，并重新生成初始上游报文。确定继续？",
+    confirmText: "重置", danger: true,
+    onConfirm: async () => {
+      try {
+        await api("/api/sync/demo/reset", { method: "POST" });
+        toast("演示数据已重置", "success");
+        renderSync();
+      } catch (e) { toast(e.message, "error"); }
+    },
+  });
+}
+
+/* ---------- 同步台（设置 + 最近一趟 + 历史） ---------- */
+async function paintSyncOverview(st) {
+  const body = $("#sync-body");
+  const s = st.settings;
+  const lr = st.last_run;
+  body.innerHTML = `
+    <div class="dash-grid" style="margin-bottom:16px">
+      <div class="panel panel-pad">
+        <h3>定时同步设置</h3>
+        <div class="form-grid" style="gap:12px">
+          <label class="kv">
+            <span class="k">定时开关</span>
+            <span class="v" style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="sy-enabled" ${s.enabled ? "checked" : ""}>
+              <span>${s.enabled ? "已开启（后台按间隔自动跑）" : "已关闭（仅手动触发）"}</span>
+            </span>
+          </label>
+          <label class="kv">
+            <span class="k">同步间隔（秒，30 ~ 86400）</span>
+            <span class="v"><input type="number" id="sy-interval" value="${s.interval_seconds}" min="30" max="86400" style="width:140px"></span>
+          </label>
+          <label class="kv">
+            <span class="k">模拟上游源剧本</span>
+            <span class="v"><select id="sy-scene" style="min-width:200px">
+              ${st.scenes.map((x) => `<option value="${x.value}" ${s.source_scene === x.value ? "selected" : ""}>${esc(x.label)}（${x.value}）</option>`).join("")}
+            </select></span>
+          </label>
+          <div><button class="btn primary" id="sy-save">保存设置</button>
+            <span style="color:var(--ink-3);font-size:12px;margin-left:8px">手动"立即同步"可临时选剧本试跑，不改这里的设置</span></div>
+        </div>
+      </div>
+      <div class="panel panel-pad">
+        <h3>最近一趟同步</h3>
+        ${lr ? `
+        <div class="kv-grid">
+          <div class="kv"><div class="k">状态</div><div class="v">${esc(lr.status_label)}</div></div>
+          <div class="kv"><div class="k">触发方式 / 触发人</div><div class="v">${esc(lr.trigger_label)} · ${esc(lr.triggered_by_name)}</div></div>
+          <div class="kv"><div class="k">开始时间</div><div class="v">${fmtTime(lr.started_at)}</div></div>
+          <div class="kv"><div class="k">耗时</div><div class="v">${fmtDuration(lr.duration_ms)}</div></div>
+          <div class="kv"><div class="k">模拟源</div><div class="v">${esc(lr.scene_label)}</div></div>
+          <div class="kv"><div class="k">待处理</div><div class="v">冲突 ${st.pending_conflicts} · 上游删除 ${st.pending_remote_deletions}</div></div>
+        </div>
+        ${lr.error_message ? `<p style="color:var(--red);margin:10px 0 0">${esc(lr.error_message)}</p>` : ""}`
+        : '<div class="empty-tip">还没有跑过同步，点右上角"立即同步一趟"</div>'}
+      </div>
+    </div>
+    ${lr ? `
+    <div class="panel panel-pad" style="margin-bottom:16px">
+      <h3>最近一趟结果（运行 #${lr.id} · 共 ${lr.total_count} 条）</h3>
+      <div class="stats-grid" style="grid-template-columns:repeat(7,1fr)">
+        ${[
+          ["新增", lr.created_count], ["改动", lr.updated_count], ["无变化", lr.unchanged_count],
+          ["两边改动待裁决", lr.conflict_count], ["未通过", lr.failed_count],
+          ["拒收复活", lr.local_deleted_count], ["上游已删待处理", lr.upstream_deleted_count],
+        ].map(([l, v]) => `<div class="panel stat-card" style="box-shadow:none">
+          <div class="num ${v ? "" : ""}" style="font-size:22px">${v}</div><div class="label">${l}</div></div>`).join("")}
+      </div>
+      <div style="margin-top:10px"><button class="btn small" id="sy-open-last">查看本趟逐条明细</button></div>
+    </div>` : ""}
+    <div class="panel panel-pad">
+      <h3>历史运行</h3>
+      <div id="sy-runs"><div class="empty-tip">加载中…</div></div>
+    </div>`;
+
+  $("#sy-save").onclick = async () => {
+    try {
+      await api("/api/sync/settings", {
+        method: "PUT",
+        body: {
+          enabled: $("#sy-enabled").checked,
+          interval_seconds: parseInt($("#sy-interval").value, 10),
+          source_scene: $("#sy-scene").value,
+        },
+      });
+      toast("同步设置已保存", "success");
+      renderSync();
+    } catch (e) { toast(e.message, "error"); }
+  };
+  if ($("#sy-open-last")) $("#sy-open-last").onclick = () => openRunModal(lr.id);
+  try {
+    const runs = await api("/api/sync/runs?limit=20");
+    $("#sy-runs").innerHTML = runs.length ? `
+      <div class="table-wrap"><table class="app-table">
+        <thead><tr><th>#</th><th>状态</th><th>触发</th><th>模拟源</th><th>时间</th><th>耗时</th>
+        <th>新增</th><th>改动</th><th>待裁决</th><th>未通过</th><th>拒收复活</th><th>上游已删</th><th></th></tr></thead>
+        <tbody>${runs.map((r) => `
+          <tr data-run="${r.id}">
+            <td>${r.id}</td>
+            <td>${esc(r.status_label)}${r.error_message ? `<div class="app-desc" style="color:var(--red)">${esc(r.error_message)}</div>` : ""}</td>
+            <td>${esc(r.trigger_label)}<div class="app-desc">${esc(r.triggered_by_name)}</div></td>
+            <td>${esc(r.scene_label)}</td>
+            <td>${fmtTime(r.started_at)}</td>
+            <td>${fmtDuration(r.duration_ms)}</td>
+            <td>${r.created_count}</td><td>${r.updated_count}</td>
+            <td>${r.conflict_count ? `<b style="color:var(--amber)">${r.conflict_count}</b>` : 0}</td>
+            <td>${r.failed_count ? `<b style="color:var(--red)">${r.failed_count}</b>` : 0}</td>
+            <td>${r.local_deleted_count}</td><td>${r.upstream_deleted_count}</td>
+            <td><button class="btn small">明细</button></td>
+          </tr>`).join("")}
+        </tbody></table></div>`
+      : '<div class="empty-tip">暂无运行记录</div>';
+    $$("#sy-runs tbody tr").forEach((tr) => {
+      tr.onclick = () => openRunModal(parseInt(tr.dataset.run, 10));
+    });
+  } catch (e) {
+    $("#sy-runs").innerHTML = errorStateHtml("加载失败", e.message);
+  }
+}
+
+/* ---------- 运行明细弹窗 ---------- */
+async function openRunModal(runId) {
+  const root = $("#modal-root");
+  root.innerHTML = `<div class="modal-mask"><div class="modal" style="width:920px">
+    <h3>同步运行 #${runId} 明细</h3><div id="rm-body"><div class="empty-tip">加载中…</div></div>
+    <div style="text-align:right;margin-top:14px"><button class="btn" id="rm-close">关闭</button></div>
+  </div></div>`;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) root.innerHTML = ""; };
+  $("#rm-close").onclick = () => { root.innerHTML = ""; };
+  let r;
+  try { r = await api(`/api/sync/runs/${runId}`); }
+  catch (e) { $("#rm-body").innerHTML = errorStateHtml("加载失败", e.message); return; }
+
+  const groups = [
+    ["failed", "未通过（卡住原因）"], ["conflict", "两边改动·待裁决"],
+    ["upstream_deleted", "上游已删·待处理"], ["local_deleted", "本地已删·拒收复活"],
+    ["created", "新增"], ["updated", "改动"], ["unchanged", "无变化"],
+  ].map(([res, label]) => ({ res, label, rows: r.items.filter((i) => i.result === res) }))
+   .filter((g) => g.rows.length);
+
+  $("#rm-body").innerHTML = `
+    <div style="color:var(--ink-2);font-size:13px;margin-bottom:10px">
+      ${esc(r.status_label)} · ${esc(r.trigger_label)}（${esc(r.triggered_by_name)}）·
+      ${fmtTime(r.started_at)} · 耗时 ${fmtDuration(r.duration_ms)} · 模拟源：${esc(r.scene_label)}
+      ${r.error_message ? ` · <span style="color:var(--red)">${esc(r.error_message)}</span>` : ""}
+    </div>
+    ${groups.map((g) => `
+      <p style="margin:12px 0 6px"><b>${esc(g.label)}（${g.rows.length}）</b></p>
+      <div class="table-wrap"><table class="env-table">
+        <thead><tr><th>类型</th><th>名称</th><th>结果</th><th>说明 / 卡在哪</th><th></th></tr></thead>
+        <tbody>${g.rows.map((it) => `
+          <tr>
+            <td>${esc(it.entity_label)}</td>
+            <td>${esc(it.name)}<div class="app-desc mono">${esc(it.external_key)}</div></td>
+            <td>${syncResultBadge(it.result, it.result_label)}</td>
+            <td style="white-space:normal;max-width:420px">${esc(it.reason || "—")}</td>
+            <td>${it.result === "conflict" ? `<button class="btn small" data-conflict-from-run="1">看差异/裁决</button>` : ""}</td>
+          </tr>`).join("")}
+        </tbody></table></div>`).join("") || '<div class="empty-tip">本趟没有条目</div>'}`;
+  $$("[data-conflict-from-run]", root).forEach((b) => {
+    b.onclick = () => {
+      root.innerHTML = "";
+      syncTab = "conflicts";
+      renderSync();
+    };
+  });
+}
+
+/* ---------- 冲突裁决 ---------- */
+async function paintSyncConflicts() {
+  const body = $("#sync-body");
+  body.innerHTML = `
+    <div class="panel panel-pad">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3 style="margin:0">两边改动待裁决</h3>
+        <select id="sc-filter" style="width:160px">
+          <option value="pending">待裁决</option>
+          <option value="all">全部（含已裁决留痕）</option>
+        </select>
+      </div>
+      <div id="sc-list" style="margin-top:12px"><div class="empty-tip">加载中…</div></div>
+    </div>`;
+  const load = async (status) => {
+    try {
+      const rows = await api(`/api/sync/conflicts?status=${status}`);
+      $("#sc-list").innerHTML = rows.length ? rows.map((c) => `
+        <div class="panel panel-pad" style="box-shadow:none;margin-bottom:10px" data-cid="${c.id}">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <div><b>${esc(c.entity_label)}：${esc(c.name)}</b>
+              <span class="app-desc mono">${esc(c.external_key)}</span>
+              ${c.status === "pending"
+                ? '<span class="badge maintenance">待裁决</span>'
+                : `<span class="badge ${c.status === "take_upstream" ? "developing" : "online"}">`
+                  + (c.status === "take_upstream" ? "已取上游" : "已留本地") + "</span>"}
+            </div>
+            <div>
+              ${c.status === "pending"
+                ? `<button class="btn small primary" data-act="decide">查看两边差异并裁决</button>`
+                : `<button class="btn small" data-act="view">查看裁决记录</button>`}
+            </div>
+          </div>
+          <div class="app-desc" style="margin-top:4px">
+            撞车字段：${esc((c.entries || []).filter((e) => e.state === "conflict").map((e) => e.label).join("、") || "无")}
+          </div>
+        </div>`).join("")
+        : '<div class="empty-tip">没有冲突记录。可在同步台把模拟源切到「改动撞车」后跑一趟制造样例。</div>';
+      $$("[data-cid]", $("#sc-list")).forEach((el) => {
+        el.onclick = () => openConflictModal(parseInt(el.dataset.cid, 10), () => load($("#sc-filter").value));
+      });
+    } catch (e) {
+      $("#sc-list").innerHTML = errorStateHtml("加载失败", e.message);
+    }
+  };
+  $("#sc-filter").onchange = () => load($("#sc-filter").value);
+  load("pending");
+}
+
+const CONFLICT_STATE_TXT = {
+  same: "三方一致", upstream_only: "仅上游改动", local_only: "仅本地改动",
+  both_same: "两边改成同值", conflict: "两边改成不同值",
+};
+
+async function openConflictModal(cid, onClose) {
+  const root = $("#modal-root");
+  root.innerHTML = `<div class="modal-mask"><div class="modal" style="width:860px">
+    <h3>冲突三方对比 #${cid}</h3><div id="cm-body"><div class="empty-tip">加载中…</div></div>
+  </div></div>`;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) { root.innerHTML = ""; if (onClose) onClose(); } };
+  let c;
+  try { c = await api(`/api/sync/conflicts/${cid}`); }
+  catch (e) { $("#cm-body").innerHTML = errorStateHtml("加载失败", e.message); return; }
+
+  const rowCls = (st) => st === "conflict" ? "background:#fde8e8"
+    : st === "upstream_only" ? "background:#e8f0ff"
+    : st === "local_only" ? "background:#e5f8ee"
+    : st === "both_same" ? "background:#fdf3d7" : "";
+  const decided = c.status !== "pending";
+  $("#cm-body").innerHTML = `
+    <p style="margin:0 0 10px">${esc(c.entity_label)} <b>${esc(c.name)}</b>
+      <span class="mono app-desc">${esc(c.external_key)}</span>：本地这段时间有人改过，上游这一趟也推了新值。
+      后到的不会盖掉先到的，请逐字段看清差异后选择整单留哪边。</p>
+    <div class="table-wrap"><table class="env-table" style="white-space:normal">
+      <thead><tr><th>字段</th><th>共同基线（上次同步）</th><th style="color:#0f8a4c">本地现值</th>
+      <th style="color:#2f6bff">上游新值</th><th>判定</th></tr></thead>
+      <tbody>${(c.entries || []).map((e) => `
+        <tr style="${rowCls(e.state)}">
+          <td><b>${esc(e.label)}</b></td>
+          <td>${esc(e.common || "（空）")}</td>
+          <td>${esc(e.local || "（空）")}</td>
+          <td>${esc(e.upstream || "（空）")}</td>
+          <td>${esc(CONFLICT_STATE_TXT[e.state] || e.state)}</td>
+        </tr>`).join("")}
+      </tbody></table></div>
+    ${decided ? `
+      <div class="panel panel-pad" style="box-shadow:none;margin-top:14px;background:#fafbfc">
+        <b>裁决结果：</b>${c.status === "take_upstream" ? "采用上游值" : "保留本地值"}<br>
+        裁决人：${esc(c.decided_by_name || "—")} · 时间：${c.decided_at ? fmtTime(c.decided_at) : "—"}<br>
+        备注：${esc(c.decide_note || "（无）")}
+      </div>
+      <div style="text-align:right;margin-top:14px"><button class="btn" id="cm-close">关闭</button></div>` : `
+      <div style="margin-top:14px">
+        <label class="k">裁决备注（可选，会记入留痕）</label>
+        <input id="cm-note" class="" maxlength="200" style="width:100%;margin-top:4px;padding:7px 10px;border:1px solid var(--line);border-radius:6px" placeholder="例如：已与上游负责人确认，以上游口径为准">
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:14px;gap:8px">
+        <button class="btn" id="cm-cancel">取消</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="cm-local" style="border-color:#0f8a4c;color:#0f8a4c">保留本地值</button>
+          <button class="btn primary" id="cm-up">采用上游值</button>
+        </div>
+      </div>`}`;
+
+  if (decided) {
+    $("#cm-close").onclick = () => { root.innerHTML = ""; if (onClose) onClose(); };
+    return;
+  }
+  const decide = async (choice) => {
+    try {
+      const r = await api(`/api/sync/conflicts/${cid}/decide`, {
+        method: "POST", body: { choice, note: $("#cm-note").value.trim() },
+      });
+      toast("裁决已记录：" + r.detail, "success");
+      root.innerHTML = "";
+      renderSync();
+    } catch (e) { toast(e.message, "error"); }
+  };
+  $("#cm-cancel").onclick = () => { root.innerHTML = ""; };
+  $("#cm-local").onclick = () => decide("keep_local");
+  $("#cm-up").onclick = () => decide("take_upstream");
+}
+
+/* ---------- 上游删除处理 ---------- */
+async function paintSyncDeletions() {
+  const body = $("#sync-body");
+  body.innerHTML = `
+    <div class="panel panel-pad">
+      <p style="margin:0 0 10px;color:var(--ink-2)">上游报文里消失（上游已删）、但本地仍挂着的记录都列在这里：
+        不会假装没看见继续挂着，需明确选择 <b>下线本地实体</b> 或 <b>确认忽略</b>，处理人与处理结果记入留痕。</p>
+      <div id="sd-list"><div class="empty-tip">加载中…</div></div>
+    </div>`;
+  try {
+    const rows = await api("/api/sync/remote-deletions?status=all");
+    $("#sd-list").innerHTML = rows.length ? `
+      <div class="table-wrap"><table class="app-table">
+        <thead><tr><th>类型</th><th>名称 / 上游标识</th><th>状态</th><th>首次发现</th>
+        <th>处理人 / 备注</th><th></th></tr></thead>
+        <tbody>${rows.map((d) => `
+          <tr>
+            <td>${esc(d.entity_label)}</td>
+            <td><b>${esc(d.name)}</b><div class="app-desc mono">${esc(d.external_key)}</div></td>
+            <td>${d.status === "pending" ? '<span class="badge maintenance">待处理</span>'
+              : d.status === "offlined" ? '<span class="badge offline">已下线</span>'
+              : '<span class="badge developing">已忽略</span>'}</td>
+            <td>#${d.first_seen_run} 趟<br><span class="app-desc">${fmtTime(d.first_seen_at)}</span></td>
+            <td style="white-space:normal;max-width:260px">${d.handled_by_name ? `${esc(d.handled_by_name)}：${esc(d.handle_note || "（无备注）")}` : "—"}</td>
+            <td style="white-space:nowrap">${d.status === "pending" ? `
+              <button class="btn small danger" data-id="${d.id}" data-act="offline">下线本地实体</button>
+              <button class="btn small" data-id="${d.id}" data-act="ignore">确认忽略</button>` : ""}</td>
+          </tr>`).join("")}
+        </tbody></table></div>`
+      : '<div class="empty-tip">没有上游删除记录。同步过程中发现报文里消失的本地实体会自动登记到这里。</div>';
+    $$("#sd-list [data-act]").forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        const id = parseInt(b.dataset.id, 10);
+        const act = b.dataset.act;
+        openNoteModal({
+          title: act === "offline" ? "下线本地实体" : "确认忽略上游删除",
+          message: act === "offline"
+            ? "将本地实体置为下线（应用置「下线」终态；模块标记已下线；无挂载的环境直接删除），并留痕。继续？"
+            : "保留本地实体并不再提醒该条上游删除（该决定会留痕）。继续？",
+          confirmText: act === "offline" ? "确认下线" : "确认忽略",
+          danger: act === "offline",
+          onConfirm: async (note) => {
+            try {
+              const r = await api(`/api/sync/remote-deletions/${id}/handle`, {
+                method: "POST", body: { action: act, note },
+              });
+              toast(r.detail, "success");
+              paintSyncDeletions();
+            } catch (err) { toast(err.message, "error"); throw err; }
+          },
+        });
+      };
+    });
+  } catch (e) {
+    $("#sd-list").innerHTML = errorStateHtml("加载失败", e.message);
+  }
+}
+
+/* ---------- 本地删除（墓碑） ---------- */
+async function paintSyncTombstones() {
+  const body = $("#sync-body");
+  body.innerHTML = `
+    <div class="panel panel-pad" style="margin-bottom:14px">
+      <h3>本地删除记录（拒收复活）</h3>
+      <p style="margin:0 0 10px;color:var(--ink-2)">本地删除同步来源实体时会立墓碑：之后上游再推同标识记录，
+        只记一条"拒收复活"，<b>不会偷偷复活成一条新记录</b>。</p>
+      <div id="st-list"><div class="empty-tip">加载中…</div></div>
+    </div>
+    <div class="panel panel-pad">
+      <h3>当前本地同步实体（可本地删除以演示拒收）</h3>
+      <div id="sl-list"><div class="empty-tip">加载中…</div></div>
+    </div>`;
+  const [tombs, local] = await Promise.all([
+    api("/api/sync/tombstones"), api("/api/sync/local-entities"),
+  ]);
+  $("#st-list").innerHTML = tombs.length ? `
+    <div class="table-wrap"><table class="app-table">
+      <thead><tr><th>类型</th><th>名称</th><th>上游标识</th><th>删除人</th><th>本地删除时间</th><th>上游最近仍推送</th></tr></thead>
+      <tbody>${tombs.map((t) => `
+        <tr><td>${esc(t.entity_label)}</td><td><b>${esc(t.name)}</b></td>
+        <td class="mono">${esc(t.external_key)}</td>
+        <td>${esc(t.deleted_by_name)}</td><td>${fmtTime(t.deleted_at)}</td>
+        <td>${t.last_pushed_at ? `第 ${t.last_pushed_run || "?"} 趟已拒收` : "删除后上游暂未再推"}</td>
+        </tr>`).join("")}</tbody></table></div>`
+    : '<div class="empty-tip">暂无本地删除记录</div>';
+
+  const sec = (title, rows, cols, etype) => rows.length ? `
+    <p style="margin:14px 0 6px"><b>${title}（${rows.length}）</b></p>
+    <div class="table-wrap"><table class="env-table">
+      <thead><tr>${cols.map((c) => `<th>${c[1]}</th>`).join("")}<th></th></tr></thead>
+      <tbody>${rows.map((r) => `
+        <tr>${cols.map((c) => `<td>${esc(c[2](r))}</td>`).join("")}
+        <td style="white-space:nowrap"><button class="btn small danger" data-del="${etype}" data-id="${r.id}">本地删除（拒收后续推送）</button></td>
+        </tr>`).join("")}</tbody></table></div>` : "";
+  $("#sl-list").innerHTML = [
+    sec("同步应用", local.apps, [
+      ["id", "ID", (r) => r.id], ["name", "应用", (r) => r.name],
+      ["bl", "业务线", (r) => r.business_line_name],
+      ["ext", "上游标识", (r) => r.external_key],
+    ], "app"),
+    sec("同步模块", local.modules, [
+      ["id", "ID", (r) => r.id], ["name", "模块", (r) => r.name],
+      ["app", "所属应用", (r) => r.app_name], ["ext", "上游标识", (r) => r.external_key],
+    ], "module"),
+    sec("同步环境", local.environments, [
+      ["id", "ID", (r) => r.id], ["name", "环境", (r) => `${r.env_label}（${r.env_key}）`],
+      ["app", "所属应用", (r) => r.app_name], ["ext", "上游标识", (r) => r.external_key],
+    ], "environment"),
+  ].join("") || '<div class="empty-tip">暂无同步来源实体，先跑一趟同步</div>';
+  $$("[data-del]", $("#sl-list")).forEach((b) => {
+    b.onclick = () => {
+      const etype = b.dataset.del;
+      const id = parseInt(b.dataset.id, 10);
+      const label = { app: "应用", module: "模块", environment: "环境" }[etype];
+      openConfirmModal({
+        title: `本地删除同步${label}`,
+        message: `删除后将立墓碑：上游再推送同标识的${label}时只记拒收，不会复活为新记录。确定删除？`,
+        confirmText: "本地删除", danger: true,
+        onConfirm: async () => {
+          try {
+            await api("/api/sync/local-entities/delete", {
+              method: "POST", body: { entity_type: etype, local_id: id },
+            });
+            toast("已本地删除并立墓碑", "success");
+            renderSync();
+          } catch (e) { toast(e.message, "error"); throw e; }
+        },
+      });
+    };
+  });
+}
+
+/* ---------- 同步留痕 ---------- */
+async function paintSyncAudit() {
+  const body = $("#sync-body");
+  body.innerHTML = `<div class="panel panel-pad"><div id="sa-list"><div class="empty-tip">加载中…</div></div></div>`;
+  try {
+    const rows = await api("/api/sync/audit?limit=200");
+    $("#sa-list").innerHTML = rows.length ? `
+      <div class="table-wrap"><table class="app-table">
+        <thead><tr><th>时间</th><th>动作</th><th>操作人</th><th>对象</th><th>详情</th><th>趟次</th></tr></thead>
+        <tbody>${rows.map((l) => `
+          <tr>
+            <td style="white-space:nowrap">${fmtTime(l.created_at)}</td>
+            <td>${esc(l.action_label)}</td>
+            <td>${esc(l.actor_name)}</td>
+            <td>${l.entity_label ? `${esc(l.entity_label)}<div class="app-desc mono">${esc(l.external_key)}</div>` : "—"}</td>
+            <td style="white-space:normal;max-width:520px">${esc(l.detail)}</td>
+            <td>${l.run_id ? `#${l.run_id}` : "—"}</td>
+          </tr>`).join("")}
+        </tbody></table></div>`
+      : '<div class="empty-tip">暂无同步留痕</div>';
+  } catch (e) {
+    $("#sa-list").innerHTML = errorStateHtml("加载失败", e.message);
+  }
+}
+
+/* ---------- 通用确认 / 备注弹窗 ---------- */
+function _modalShell(width) {
+  const root = $("#modal-root");
+  root.innerHTML = `<div class="modal-mask"><div class="modal" style="width:${width || 440}px">
+    <h3 id="gm-title"></h3><div id="gm-body"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+      <button class="btn" id="gm-cancel">取消</button>
+      <button class="btn primary" id="gm-ok"></button>
+    </div></div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  $("#gm-cancel").onclick = close;
+  return { root, close };
+}
+
+function openConfirmModal({ title, message, confirmText, danger, onConfirm }) {
+  const { close } = _modalShell();
+  $("#gm-title").textContent = title;
+  $("#gm-body").innerHTML = `<p style="margin:0;color:var(--ink-2)">${esc(message)}</p>`;
+  const ok = $("#gm-ok");
+  ok.textContent = confirmText || "确认";
+  if (danger) ok.classList.add("danger");
+  ok.onclick = async () => {
+    ok.disabled = true;
+    try {
+      await onConfirm();
+      close();
+    } catch (e) { ok.disabled = false; }
+  };
+}
+
+function openNoteModal({ title, message, confirmText, danger, onConfirm }) {
+  const { close } = _modalShell(480);
+  $("#gm-title").textContent = title;
+  $("#gm-body").innerHTML = `
+    <p style="margin:0 0 10px;color:var(--ink-2)">${esc(message)}</p>
+    <input id="gm-note" maxlength="200" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px" placeholder="处理备注（可选，记入留痕）">`;
+  const ok = $("#gm-ok");
+  ok.textContent = confirmText || "确认";
+  if (danger) ok.classList.add("danger");
+  ok.onclick = async () => {
+    ok.disabled = true;
+    try {
+      await onConfirm($("#gm-note").value.trim());
+      close();
+    } catch (e) { ok.disabled = false; }
+  };
 }
 
 /* ---------------- 错误态 ---------------- */

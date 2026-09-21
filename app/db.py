@@ -293,6 +293,162 @@ CREATE INDEX IF NOT EXISTS idx_iev_app_time ON instance_events(app_id, created_a
 CREATE INDEX IF NOT EXISTS idx_opsaudit_app ON ops_audit_logs(app_id);
 CREATE INDEX IF NOT EXISTS idx_opsaudit_time ON ops_audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_opsaudit_cat ON ops_audit_logs(category);
+
+-- ====================================================================
+-- 上游数据同步（应用 / 模块 / 环境）
+-- ====================================================================
+-- 模拟上游源的"上游库"：同步服务每趟从这里拉报文（不连真实云）
+CREATE TABLE IF NOT EXISTS sync_source_records (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('app','module','environment')),
+    external_key     TEXT NOT NULL,
+    parent_app_key   TEXT,                       -- 模块/环境所属应用的 external_key
+    payload_json     TEXT NOT NULL DEFAULT '{}',
+    is_deleted       INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0,1)),
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (entity_type, external_key)
+);
+
+-- 业务模块（随同步引入的新实体；本地也可手工维护）
+CREATE TABLE IF NOT EXISTS sync_modules (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id           INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    external_id      TEXT,                       -- 上游稳定标识；本地手工登记的为 NULL
+    name             TEXT NOT NULL,
+    module_type      TEXT NOT NULL DEFAULT 'service',   -- service/job/middleware/frontend
+    description      TEXT NOT NULL DEFAULT '',
+    -- active 在用 / archived 本地归档 / offlined 因上游删除而被本地下线
+    status           TEXT NOT NULL DEFAULT 'active'
+                     CHECK (status IN ('active','archived','offlined')),
+    baseline_payload TEXT NOT NULL DEFAULT '{}', -- 上次同步应用时的上游值（三方对比的共同基线）
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (app_id, name)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mod_ext
+    ON sync_modules(external_id) WHERE external_id IS NOT NULL;
+
+-- 单例行设置（单行 id=1）：定时开关、间隔秒数、模拟源档位
+CREATE TABLE IF NOT EXISTS sync_settings (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    interval_seconds   INTEGER NOT NULL DEFAULT 300,
+    source_scene       TEXT NOT NULL DEFAULT 'steady',  -- 模拟源剧本：steady/conflict/delete...
+    updated_by         INTEGER REFERENCES users(id),
+    updated_at         INTEGER NOT NULL DEFAULT 0
+);
+
+-- 同步运行记录：每趟一行（谁触发、自动还是手动、起止时间、耗时、成败与计数）
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type     TEXT NOT NULL CHECK (trigger_type IN ('manual','scheduled')),
+    triggered_by     INTEGER REFERENCES users(id),       -- scheduled 时为 NULL（系统调度）
+    started_at       INTEGER NOT NULL,
+    finished_at      INTEGER,
+    duration_ms      INTEGER,
+    status           TEXT NOT NULL DEFAULT 'running'
+                     CHECK (status IN ('running','success','partial','failed')),
+    source_scene     TEXT NOT NULL DEFAULT '',
+    total_count      INTEGER NOT NULL DEFAULT 0,         -- 上游这一趟推送的总条数
+    created_count    INTEGER NOT NULL DEFAULT 0,         -- 新增落库
+    updated_count    INTEGER NOT NULL DEFAULT 0,         -- 上游改动已应用
+    unchanged_count  INTEGER NOT NULL DEFAULT 0,
+    conflict_count   INTEGER NOT NULL DEFAULT 0,         -- 两边都改、挂起待裁决
+    failed_count     INTEGER NOT NULL DEFAULT 0,         -- 校验未通过
+    local_deleted_count   INTEGER NOT NULL DEFAULT 0,    -- 推来的是本地已删记录（墓碑）
+    upstream_deleted_count INTEGER NOT NULL DEFAULT 0,   -- 上游已删、本地待处理
+    error_message    TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL
+);
+
+-- 同步条目明细：每趟 × 每条上游记录一行，结果与卡住原因都落在这
+CREATE TABLE IF NOT EXISTS sync_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('app','module','environment')),
+    external_key     TEXT NOT NULL,             -- 上游稳定标识
+    name             TEXT NOT NULL DEFAULT '',
+    result           TEXT NOT NULL CHECK (result IN (
+                         'created','updated','unchanged','conflict',
+                         'failed','local_deleted','upstream_deleted')),
+    reason           TEXT NOT NULL DEFAULT '',  -- failed 卡在哪 / 各结果的说明
+    detail_json      TEXT NOT NULL DEFAULT '{}' -- 差异摘要、本地/上游值快照等
+
+);
+CREATE INDEX IF NOT EXISTS idx_syncitems_run ON sync_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_syncitems_result ON sync_items(result);
+
+-- 冲突待裁决队列：本地与上游都改了同一条，绝不让后到的悄悄盖掉先到的
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('app','module','environment')),
+    external_key     TEXT NOT NULL,
+    local_entity_id  INTEGER,                   -- 本地实体主键（applications.id 等）
+    name             TEXT NOT NULL DEFAULT '',
+    -- 三方对比：common=上次同步的基线值，local=本地现值，upstream=这一趟上游值
+    common_payload   TEXT NOT NULL DEFAULT '{}',
+    local_payload    TEXT NOT NULL DEFAULT '{}',
+    upstream_payload TEXT NOT NULL DEFAULT '{}',
+    changed_fields   TEXT NOT NULL DEFAULT '[]',
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','keep_local','take_upstream')),
+    decided_by       INTEGER REFERENCES users(id),
+    decided_at       INTEGER,
+    decide_note      TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL
+);
+-- 仅 pending 行互斥（部分唯一索引）：裁决完的冲突留行留痕，
+-- 之后同一实体再次两边改动仍可重新入队，因此表上不能建普通 UNIQUE。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_syncconf_pending
+    ON sync_conflicts(entity_type, external_key) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_syncconf_status ON sync_conflicts(status);
+
+-- 本地删除墓碑：本地删掉的上游来源实体，再被推回来时识别"这是复活推送"，不偷偷新建
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('app','module','environment')),
+    external_key     TEXT NOT NULL,
+    name             TEXT NOT NULL DEFAULT '',
+    deleted_by       INTEGER REFERENCES users(id),
+    deleted_at       INTEGER NOT NULL,
+    last_pushed_run  INTEGER,                   -- 最近一次上游仍在推它的同步趟次
+    UNIQUE (entity_type, external_key)
+);
+
+-- 上游删除台账：上游删掉了某实体，本地不能假装没看见；处理动作（下线/忽略）记在这里
+CREATE TABLE IF NOT EXISTS sync_remote_deletions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('app','module','environment')),
+    external_key     TEXT NOT NULL,
+    name             TEXT NOT NULL DEFAULT '',
+    local_entity_id  INTEGER,
+    first_seen_run   INTEGER NOT NULL,
+    first_seen_at    INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','offlined','ignored')),
+    handled_by       INTEGER REFERENCES users(id),
+    handled_at       INTEGER,
+    handle_note      TEXT NOT NULL DEFAULT '',
+    UNIQUE (entity_type, external_key)
+);
+CREATE INDEX IF NOT EXISTS idx_remdel_status ON sync_remote_deletions(status);
+
+-- 同步操作留痕：触发/调度、设置变更、冲突裁决、上游删除处理全部进这张流水
+CREATE TABLE IF NOT EXISTS sync_audit_logs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id         INTEGER REFERENCES users(id),   -- NULL = 系统调度
+    action           TEXT NOT NULL,                   -- trigger/run_finish/setting/conflict/remote_delete
+    entity_type      TEXT NOT NULL DEFAULT '',
+    external_key     TEXT NOT NULL DEFAULT '',
+    detail           TEXT NOT NULL DEFAULT '',
+    run_id           INTEGER REFERENCES sync_runs(id) ON DELETE SET NULL,
+    created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_syncaudit_time ON sync_audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_syncaudit_run ON sync_audit_logs(run_id);
 """
 
 _local = threading.local()
@@ -316,7 +472,39 @@ def init_db() -> None:
     _migrate_env_checks(conn)
     _backfill_app_environments(conn)
     _repair_audit_environment(conn)
+    _migrate_sync_columns(conn)
     conn.commit()
+
+
+def _migrate_sync_columns(conn) -> None:
+    """同步功能给既有表补列：external_id（上游稳定标识）与 baseline_payload（三方对比基线）。
+
+    CREATE TABLE IF NOT EXISTS 不会给既有表加列；SQLite 支持 ADD COLUMN（带常量默认值），
+    按 PRAGMA table_info 幂等检测，旧库平滑升级。
+    """
+    wanted = {
+        "applications": [
+            ("external_id", "TEXT"),
+            ("baseline_payload", "TEXT NOT NULL DEFAULT '{}'"),
+        ],
+        "app_environments": [
+            ("external_id", "TEXT"),
+            ("baseline_payload", "TEXT NOT NULL DEFAULT '{}'"),
+        ],
+    }
+    for table, cols in wanted.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_external "
+        "ON applications(external_id) WHERE external_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_appenv_external "
+        "ON app_environments(external_id) WHERE external_id IS NOT NULL"
+    )
 
 
 # 标准环境的默认发布窗口（新建应用 / 旧库回填时使用；业务线随后可自行调整）
