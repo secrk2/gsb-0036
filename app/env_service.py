@@ -353,6 +353,8 @@ def env_to_dict(row, app_row: dict | None = None, at: int | None = None) -> dict
         "env_key": row["env_key"],
         "env_label": row["env_label"],
         "is_builtin": bool(row["is_builtin"]),
+        "from_upstream": row["source_id"] is not None,
+        "source_deleted": bool(row["source_deleted"]),
         "is_primary": is_primary,
         "deploy_restricted": bool(row["deploy_restricted"]),
         "window_days": json.loads(row["window_days"] or "[]"),
@@ -453,6 +455,15 @@ def delete_environment(app_id: int, env_id: int, app_row: dict, user: dict) -> N
     now = int(time.time())
     get_conn().execute("DELETE FROM app_environments WHERE id=?", (env_id,))
     get_conn().commit()
+    # 同步墓碑：本地删除的上游环境，上游再推来时不自动复活（局部导入避免循环依赖）
+    try:
+        from . import sync_service as sync
+        app = query_one("SELECT source_id FROM applications WHERE id=?", (app_id,))
+        sync._write_tombstone("env", row["source_id"], app["source_id"] if app else "",
+                              row["env_label"], user["id"], now)
+        sync._close_pending_on_delete("env", row["source_id"], user, now)
+    except Exception:  # 同步子系统异常不应阻断环境删除主流程
+        pass
     log_ops(app_id, row["env_key"], row["env_label"], "env_delete", row["env_label"],
             f"删除环境「{row['env_label']}」（标识 {row['env_key']}，删除前无配置与实例挂载）",
             user["id"], now)

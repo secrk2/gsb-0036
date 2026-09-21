@@ -172,6 +172,10 @@ def seed_if_empty() -> bool:
     seed_config_profiles(app_ids, user_ids, now)
     seed_transfers(app_ids, user_ids, bl_ids, now)
     seed_environments_and_health(app_ids, user_ids, now)
+    # 把本地台账注册进模拟上游并补齐模块，使首轮"立即同步"全部无变化；
+    # 之后可用同步中心的"模拟上游演一幕"制造新增/冲突/删除场景
+    from . import sync_source
+    sync_source.reset_source(None)
     return True
 
 

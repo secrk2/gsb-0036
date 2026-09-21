@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from . import permissions as perms
 from . import env_service as esvc
+from . import sync_service as svc_sync
 from .auth import (
     User, ensure_bl_visible, err, get_app_checked, get_app_or_404,
     get_app_writable, is_admin, public_user,
@@ -20,6 +21,7 @@ from .db import (
 from .routers import admin as admin_router
 from .routers import config as config_router
 from .routers import ops as ops_router
+from .routers import sync as sync_router
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -28,6 +30,7 @@ app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
 app.include_router(admin_router.router)
 app.include_router(ops_router.router)
+app.include_router(sync_router.router)
 
 
 @app.on_event("startup")
@@ -36,6 +39,8 @@ def startup() -> None:
     seed_if_empty()
     # 预热审计索引（config_audit_logs 没有 scope 列，按实际存在的索引列预热）
     query("SELECT created_at FROM config_audit_logs LIMIT 1")
+    svc_sync.ensure_settings()
+    svc_sync.start_scheduler()
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -74,6 +79,8 @@ def app_to_dict(row, with_env: bool = False) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "env_var_count": len(env_vars),
+        "from_upstream": row["source_id"] is not None,
+        "source_deleted": bool(row["source_deleted"]),
         "red_dots": ([{"type": "missing_owner", "label": "缺失负责人"}] if missing_owner else [])
                     + ([{"type": "missing_env", "label": "环境变量缺失"}] if missing_env else []),
     }

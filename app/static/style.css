@@ -568,3 +568,104 @@ button { font-family: inherit; }
 .action-tag.window_update, .action-tag.holiday_add, .action-tag.holiday_remove { background: #e8f0ff; color: #2f6bff; }
 .action-tag.instance_restart { background: #fdf3d7; color: #ad7209; }
 .action-tag.instance_register, .action-tag.instance_remove { background: #eceff3; color: #6b7686; }
+
+/* ==================== 上游数据同步（本轮新增） ==================== */
+
+/* 调度控制条 */
+.sync-ctrl { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.sync-sched { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sync-sched input[type="number"] {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.sync-last { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--ink-2); flex-wrap: wrap; }
+
+/* 趟次状态徽标 */
+.run-status {
+  display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px;
+  padding: 2px 10px; white-space: nowrap; background: #eef1f6; color: var(--ink-2);
+}
+.run-status.success { background: #e5f8ee; color: #0f8a4c; }
+.run-status.partial { background: #fdf3d7; color: #ad7209; }
+.run-status.failed  { background: #fde8e8; color: #c02f33; }
+.run-status.running { background: #e8f0ff; color: #2f6bff; }
+.run-status.running::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; margin-left: 6px; animation: blink 1s infinite;
+}
+
+/* 同步统计卡片 */
+.sync-stat .num { font-size: 24px; }
+.sync-stat.add .num { color: #0f8a4c; }
+.sync-stat.update .num { color: #ad7209; }
+.sync-stat.conflict .num, .sync-stat.updel .num, .sync-stat.lodel .num { color: #c02f33; }
+.sync-stat.invalid .num { color: #c02f33; }
+.sync-stat.hot { border-color: #f3c1c2; box-shadow: 0 0 0 2px rgba(192,47,51,.12); }
+
+/* 通用同步小标签 */
+.sync-tag {
+  display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 6px;
+  background: #eef1f6; color: var(--ink-2); white-space: nowrap; margin-right: 4px;
+}
+.sync-tag.add { background: #e5f8ee; color: #0f8a4c; }
+.sync-tag.update { background: #fdf3d7; color: #ad7209; }
+.sync-tag.conflict { background: #fde8e8; color: #c02f33; }
+.sync-tag.updel { background: #fde8e8; color: #c02f33; }
+.sync-tag.lodel { background: #f3e8ff; color: #7c3aed; }
+.sync-tag.invalid { background: #fde8e8; color: #c02f33; }
+.sync-tag.same { background: #e5f8ee; color: #0f8a4c; }
+
+/* 待裁决列表 */
+.conflict-item {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  background: #fafbfc;
+}
+.conflict-item.pending { border-left: 3px solid var(--red); }
+.conflict-item.resolved { opacity: .8; border-left: 3px solid var(--green); }
+.ci-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.ci-time { margin-left: auto; color: var(--ink-3); font-size: 12px; }
+.ci-actions { margin-top: 8px; text-align: right; }
+.ci-resolved { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); }
+
+/* 趟次列表 */
+.run-list { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow-y: auto; }
+.run-row { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; cursor: pointer; background: #fafbfc; }
+.run-row:hover { border-color: var(--brand); background: #f6f9ff; }
+.rr-top { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.rr-who { color: var(--ink-2); }
+.rr-dur { margin-left: auto; color: var(--ink-3); font-size: 12px; }
+.rr-nums { display: flex; gap: 10px; margin-top: 5px; font-size: 12px; color: var(--ink-2); flex-wrap: wrap; }
+.rr-nums .n-add { color: #0f8a4c; }
+.rr-nums .n-upd { color: #ad7209; }
+.rr-nums .n-inv, .rr-nums .n-conf { color: #c02f33; font-weight: 600; }
+
+/* 趟次明细表 */
+.sync-items-wrap { max-height: 420px; overflow-y: auto; margin-top: 8px; }
+.sync-items-table td { white-space: normal; vertical-align: top; }
+.sync-items-table tr.item-invalid td { background: #fff5f5; }
+.sync-items-table tr.item-conflict td,
+.sync-items-table tr.item-upstream_deleted td,
+.sync-items-table tr.item-local_deleted td { background: #fffaf0; }
+
+/* 模拟源说明 */
+.scenario-note {
+  font-size: 12.5px; color: var(--ink-2); background: #f7f9fc;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+}
+.scenario-note ul { margin: 6px 0 0; padding-left: 18px; }
+
+/* 裁决弹窗备注 */
+.sync-note-input {
+  width: 100%; border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; margin-top: 4px;
+}
+.sync-diff-table td { white-space: normal !important; word-break: break-all; }
+
+/* 应用详情上游删除横幅 */
+.sync-del-banner {
+  border-left: 4px solid var(--red); background: #fdf0f0;
+  color: #a02a2e; font-size: 13px; margin-bottom: 16px;
+}
+.row-source-deleted { background: #fff7f7; }
+.row-source-deleted:hover { background: #ffefef !important; }
+

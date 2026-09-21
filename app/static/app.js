@@ -13,6 +13,7 @@ const state = {
   configFilters: { app_id: "", environment: "" },
   auditFilters: { app_id: "", business_line_id: "", environment: "", action: "", start: "", end: "" },
   opsFilters: { app_id: "", business_line_id: "", environment: "", category: "", start: "", end: "" },
+  syncRunTab: "items",
 };
 
 /* ---------------- 工具 ---------------- */
@@ -212,6 +213,10 @@ function route() {
     if (parts[1]) renderConfigProfile(parts[1], parts[2] || "");
     else renderConfigList();
   } else if (parts[0] === "audit") renderAudit();
+  else if (parts[0] === "sync") {
+    if (parts[1] === "runs" && parts[2]) renderSyncCenter({ openRunId: parts[2] });
+    else renderSyncCenter();
+  }
   else if (parts[0] === "admin") renderAdmin();
   else renderConsole();
 }
@@ -444,8 +449,10 @@ async function loadAppList() {
         </tr></thead>
         <tbody>
           ${apps.map((a) => `
-            <tr data-app-id="${a.id}">
-              <td class="app-name-cell">${esc(a.name)}<div class="app-desc">${esc(a.description || "")}</div></td>
+            <tr data-app-id="${a.id}" class="${a.source_deleted ? "row-source-deleted" : ""}">
+              <td class="app-name-cell">${esc(a.name)}
+                ${a.source_deleted ? ' <span class="sync-tag updel">上游已删除·待裁决</span>' : ""}
+                <div class="app-desc">${esc(a.description || "")}</div></td>
               <td>${esc(a.business_line_name)}</td>
               <td>${a.owner_name ? esc(a.owner_name) : '<span class="red-dot">未设置</span>'}</td>
               <td>${esc(a.cluster)}</td>
@@ -465,6 +472,7 @@ async function loadAppList() {
             ${envTag(a)}
             ${statusBadge(a)}
           </div>
+          ${a.source_deleted ? '<div style="margin:4px 0"><span class="sync-tag updel">上游已删除·待裁决</span></div>' : ""}
           <div class="card-fields">
             <div class="cf"><span class="k">业务线</span>${esc(a.business_line_name)}</div>
             <div class="cf"><span class="k">负责人</span>${a.owner_name ? esc(a.owner_name) : "未设置"}</div>
@@ -502,11 +510,16 @@ async function renderAppDetail(appId) {
   const nextStatuses = STATUS_FLOW.slice(curIdx + 1);
   const canManage = !!app.can_manage;
   const canTransfer = !!app.can_transfer;
+  const canDeleteApp = state.user.role === "admin"
+    || (state.user.role === "bl_owner" && state.user.business_line_id === app.business_line_id);
 
   view.innerHTML = `
     <div class="page-head">
       <div>
-        <h2>${esc(app.name)} ${statusBadge(app)}</h2>
+        <h2>${esc(app.name)} ${statusBadge(app)}
+          ${app.source_deleted ? '<span class="sync-tag updel" style="margin-left:8px">上游已删除 · 待裁决</span>' : ""}
+          ${app.from_upstream && !app.source_deleted ? '<span class="sync-tag same" style="margin-left:8px">上游同步纳管</span>' : ""}
+        </h2>
         <div class="sub">${esc(app.business_line_name)} · ${esc(app.cluster)} · ${esc(app.environment_label)}环境</div>
       </div>
       <div style="display:flex;gap:8px">
@@ -516,9 +529,14 @@ async function renderAppDetail(appId) {
         <button class="btn" id="btn-config">配置档案</button>
         ${canTransfer ? '<button class="btn" id="btn-transfer">应用交接</button>' : ""}
         ${canManage && !isOffline ? '<button class="btn" id="btn-edit">编辑信息</button>' : ""}
+        ${canDeleteApp ? '<button class="btn danger" id="btn-delete-app">删除应用</button>' : ""}
       </div>
     </div>
 
+    ${app.source_deleted ? `<div class="panel panel-pad sync-del-banner">
+      上游已经删除了该应用，本地暂时保留并在列表中明确标记，不会假装没看见。
+      请前往 <a href="#/sync">数据同步</a> 决定跟随删除还是保留本地。
+    </div>` : ""}
     ${!canManage ? `<div class="panel panel-pad perm-notice">
       你当前以<b>只读方式</b>查看该应用：${esc(state.user.permissions.role_label)}
       无权修改其台账信息、生命周期与环境变量；需要变更请联系该应用负责人或所属业务线负责人。
@@ -568,6 +586,10 @@ async function renderAppDetail(appId) {
           <h3>环境变量 ${app.env_vars.length === 0 ? '<span class="red-dot">环境变量缺失</span>' : `<span style="color:var(--ink-3);font-weight:400;font-size:12px">（${app.env_vars.length} 项）</span>`}</h3>
           <div id="env-editor"></div>
         </div>
+
+        <div class="panel panel-pad" style="margin-top:16px" id="app-modules">
+          <div class="empty-tip">模块加载中…</div>
+        </div>
       </div>
 
       <div>
@@ -605,10 +627,13 @@ async function renderAppDetail(appId) {
   if (transferBtn) transferBtn.onclick = () => openTransferModal(app);
   const editBtn = $("#btn-edit");
   if (editBtn) editBtn.onclick = () => openAppModal(app);
+  const delAppBtn = $("#btn-delete-app");
+  if (delAppBtn) delAppBtn.onclick = () => openDeleteAppModal(app);
   $$("[data-to-status]", view).forEach((btn) => {
     btn.onclick = () => transitionStatus(app.id, btn.dataset.toStatus);
   });
   renderEnvEditor(app);
+  renderAppModules(app);
 }
 
 function renderEnvEditor(app) {
@@ -2168,6 +2193,7 @@ async function paintEnvList(app) {
             <span class="ec-name">${esc(e.env_label)}</span>
             ${e.is_primary ? '<span class="ec-primary">应用所属环境</span>' : ""}
             ${e.is_builtin ? "" : '<span class="ec-tag">自定义</span>'}
+            ${e.source_deleted ? '<span class="sync-tag updel">上游已删除</span>' : ""}
           </div>
           <div class="ec-window" title="${esc(e.window_text)}">🕒 ${esc(e.window_text)}</div>
           <div class="ec-health">
@@ -2672,6 +2698,654 @@ async function openWindowModalFromHealth(app, env, onChange) {
   const envs = await api(`/api/apps/${app.id}/environments`);
   const full = envs.find((x) => x.env_key === env.environment);
   openWindowModal(app, full, onChange);
+}
+
+/* ---------------- 数据同步中心 ---------------- */
+
+const SYNC_RESULT_META = {
+  created:           { label: "新增",       cls: "add" },
+  updated:           { label: "改动",       cls: "update" },
+  unchanged:         { label: "无变化",     cls: "same" },
+  conflict:          { label: "双方同改",   cls: "conflict" },
+  upstream_deleted:  { label: "上游删除",   cls: "updel" },
+  local_deleted:     { label: "本地已删",   cls: "lodel" },
+  invalid:           { label: "未通过",     cls: "invalid" },
+  ignored:           { label: "跳过/忽略",  cls: "same" },
+};
+const SYNC_ENTITY_LABEL = { app: "应用", env: "环境", module: "模块" };
+const SYNC_KIND_META = {
+  both_changed: { label: "双方都改过", cls: "conflict" },
+  upstream_deleted: { label: "上游已删除", cls: "updel" },
+  local_deleted: { label: "本地已删，上游仍推", cls: "lodel" },
+};
+
+function fmtDuration(ms) {
+  if (ms == null) return "—";
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(2)} 秒`;
+}
+
+let syncPollTimer = null;
+
+async function renderSyncCenter(opts) {
+  opts = opts || {};
+  const view = $("#view");
+  view.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let st;
+  try {
+    st = await api("/api/sync/status");
+  } catch (e) {
+    view.innerHTML = errorStateHtml("加载失败", e.message);
+    return;
+  }
+  const isAdmin = state.user.role === "admin";
+  const s = st.settings || {};
+  const last = st.last_run;
+  const t = (last && last.totals) || {};
+  const p = st.pending || { total: 0 };
+
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>数据同步</h2>
+        <div class="sub">上游周期推送 应用 / 环境 / 模块；双方同改不自动覆盖，删除分场景处理，每趟结果与裁决全程留痕</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="sy-refresh">刷新</button>
+        ${state.user.role === "viewer" ? "" : `<button class="btn primary" id="sy-run" ${st.running ? "disabled" : ""}>${st.running ? "同步进行中…" : "立即同步一趟"}</button>`}
+      </div>
+    </div>
+
+    <div class="panel panel-pad" style="margin-bottom:16px">
+      <div class="sync-ctrl">
+        <div class="sync-sched">
+          <label class="chk"><input type="checkbox" id="sy-enabled" ${s.enabled ? "checked" : ""} ${isAdmin ? "" : "disabled"}>
+            <b>定时同步</b><span class="field-hint" style="margin:0">${s.enabled ? "已开启" : "已关闭"}</span></label>
+          <span style="display:inline-flex;align-items:center;gap:6px">
+            每隔 <input id="sy-interval" value="${s.interval_seconds}" style="width:90px"
+              ${isAdmin ? "" : "disabled"}> 秒
+            <span class="field-hint" style="margin:0">（30–86400）</span>
+          </span>
+          ${isAdmin ? '<button class="btn small" id="sy-save">保存设置</button>' : ""}
+        </div>
+        <div class="sync-last">
+          ${last ? `
+            <span>最近一趟：<b>${fmtTime(last.started_at)}</b> · ${esc(last.triggered_by_name)} · 耗时 ${fmtDuration(last.duration_ms)}</span>
+            <span class="run-status ${esc(last.status)}">${esc(last.status_label)}</span>
+            ${st.next_run_at && s.enabled ? `<span class="field-hint" style="margin:0">下次约 ${fmtTime(st.next_run_at)}</span>` : ""}
+          ` : '<span class="field-hint" style="margin:0">还没有跑过同步</span>'}
+          ${st.running ? '<span class="run-status running">同步进行中…</span>' : ""}
+        </div>
+      </div>
+    </div>
+
+    <div class="stats-grid" id="sy-stats">
+      ${syncStatCard("接收", t.received || 0, "", last)}
+      ${syncStatCard("新增", t.created || 0, "add", last)}
+      ${syncStatCard("改动", t.updated || 0, "update", last)}
+      ${syncStatCard("双方同改待裁决", p.both_changed || 0, "conflict", last, true)}
+      ${syncStatCard("上游删除待裁决", p.upstream_deleted || 0, "updel", last, true)}
+      ${syncStatCard("本地已删待裁决", p.local_deleted || 0, "lodel", last, true)}
+      ${syncStatCard("未通过", t.invalid || 0, "invalid", last)}
+      ${syncStatCard("无变化/跳过", (t.unchanged || 0) + (t.ignored || 0), "same", last)}
+    </div>
+    ${last ? `<p style="margin:-6px 2px 16px">
+      <a href="javascript:void(0)" id="sy-open-last">查看最近一趟（#${last.id}）的逐条结果与未通过原因</a>
+    </p>` : ""}
+
+    <div class="dash-grid" style="grid-template-columns:1.7fr 1fr">
+      <div class="panel panel-pad sync-conflict-panel">
+        <h3>⚖️ 待裁决差异
+          <span style="font-weight:400;font-size:12px;color:var(--ink-3)">本地与上游改了同一条 / 两边删除不一致，由人决定留哪边</span>
+        </h3>
+        <div class="admin-tabs">
+          <button class="adm-tab" data-ct="pending">待处理（${p.total}）</button>
+          <button class="adm-tab" data-ct="resolved">已处理留痕</button>
+        </div>
+        <div id="sy-conflicts"><div class="empty-tip">加载中…</div></div>
+      </div>
+
+      <div>
+        ${isAdmin ? `
+        <div class="panel panel-pad" style="margin-bottom:16px">
+          <h3>🧪 模拟同步源</h3>
+          <p style="font-size:12.5px;color:var(--ink-2);margin:0 0 10px">
+            演示环境不连真云。当前已演到第 <b id="sy-stage">${st.source.stage}</b> 幕；
+            源中应用 ${st.source.counts.app || 0}（含删除标记 ${st.source.counts.app_deleted || 0}）、
+            环境 ${st.source.counts.env || 0}、模块 ${st.source.counts.module || 0}。
+          </p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn small" id="sy-reset">源与本地重新对齐</button>
+            <button class="btn primary small" id="sy-advance">模拟上游推新一幕</button>
+          </div>
+          <div id="sy-scenario" style="margin-top:10px"></div>
+        </div>` : ""}
+        <div class="panel panel-pad">
+          <h3>同步趟次记录</h3>
+          <div id="sy-runs"><div class="empty-tip">加载中…</div></div>
+        </div>
+      </div>
+    </div>`;
+
+  $("#sy-refresh").onclick = () => renderSyncCenter();
+  const runBtn = $("#sy-run");
+  if (runBtn) runBtn.onclick = () => triggerSync();
+  const saveBtn = $("#sy-save");
+  if (saveBtn) saveBtn.onclick = saveSyncSettings;
+  const lastLink = $("#sy-open-last");
+  if (lastLink) lastLink.onclick = () => openSyncRunModal(last.id, renderSyncCenter);
+  $$(".adm-tab[data-ct]", view).forEach((b) => {
+    b.classList.toggle("active", b.dataset.ct === "pending");
+    b.onclick = () => loadConflicts(b.dataset.ct);
+  });
+  const resetBtn = $("#sy-reset");
+  if (resetBtn) resetBtn.onclick = resetSource;
+  const advBtn = $("#sy-advance");
+  if (advBtn) advBtn.onclick = advanceSource;
+
+  loadConflicts("pending");
+  loadRuns();
+  if (opts.openRunId) openSyncRunModal(opts.openRunId, renderSyncCenter);
+  if (st.running) scheduleSyncPoll();
+}
+
+function syncStatCard(label, n, cls, last, pendingCount) {
+  const hot = pendingCount && n > 0;
+  return `<div class="panel stat-card sync-stat ${cls || ""} ${hot ? "hot" : ""}">
+    <div class="num">${n}</div><div class="label">${esc(label)}</div>
+  </div>`;
+}
+
+async function saveSyncSettings() {
+  try {
+    await api("/api/sync/settings", {
+      method: "PUT",
+      body: { enabled: $("#sy-enabled").checked, interval_seconds: parseInt($("#sy-interval").value, 10) },
+    });
+    toast("同步调度设置已保存", "success");
+    renderSyncCenter();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function triggerSync() {
+  const btn = $("#sy-run");
+  if (btn) { btn.disabled = true; btn.textContent = "同步中…"; }
+  try {
+    const res = await api("/api/sync/run", { method: "POST" });
+    toast(`同步完成：接收 ${res.totals.received}，新增 ${res.totals.created}，改动 ${res.totals.updated}，`
+      + `未通过 ${res.totals.invalid}，待裁决 ${res.totals.conflicts + res.totals.upstream_deleted + res.totals.local_deleted}`,
+      res.status === "partial" ? "" : "success");
+    renderSyncCenter();
+    openSyncRunModal(res.run_id, renderSyncCenter);
+  } catch (e) {
+    toast(e.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = "立即同步一趟"; }
+    if (e.status === 409) scheduleSyncPoll();
+  }
+}
+
+function scheduleSyncPoll() {
+  clearTimeout(syncPollTimer);
+  syncPollTimer = setTimeout(async () => {
+    try {
+      const st = await api("/api/sync/status");
+      if (st.running) scheduleSyncPoll();
+      else renderSyncCenter();
+    } catch (e) { /* 忽略轮询错误 */ }
+  }, 2500);
+}
+
+async function resetSource() {
+  if (!confirm("将模拟源与本地台账重新对齐：现有应用/环境/模块全部认领为上游数据，并清除演示待裁决。确定？")) return;
+  try {
+    const r = await api("/api/sync/source/reset", { method: "POST" });
+    toast("模拟源已重新对齐，下一趟同步应全部「无变化」", "success");
+    renderSyncCenter();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function advanceSource() {
+  try {
+    const r = await api("/api/sync/source/advance", { method: "POST" });
+    const box = $("#sy-scenario");
+    box.innerHTML = `<div class="scenario-note"><b>第 ${r.stage} 幕上游变更：</b>
+      <ul>${r.changes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
+      <p style="margin:4px 0 0">点「立即同步一趟」看这一趟的结果。</p></div>`;
+    toast(`模拟上游已演进到第 ${r.stage} 幕`, "success");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function loadConflicts(kind) {
+  const box = $("#sy-conflicts");
+  box.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let rows;
+  try {
+    rows = await api(`/api/sync/conflicts?status=${kind === "pending" ? "pending" : "resolved"}`);
+  } catch (e) { box.innerHTML = errorStateHtml("加载失败", e.message); return; }
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty-tip">${kind === "pending" ? "没有待裁决差异，本地与上游一致 🎉" : "暂无已处理记录"}</div>`;
+    return;
+  }
+  box.innerHTML = rows.map((c) => {
+    const km = SYNC_KIND_META[c.kind];
+    const target = c.entity === "app"
+      ? esc(c.name || c.app_name)
+      : `${esc(c.parent_name || c.app_name)} <span class="field-hint">/</span> ${esc(c.name)}`;
+    return `<div class="conflict-item ${c.status === 'pending' ? 'pending' : 'resolved'}">
+      <div class="ci-head">
+        <span class="sync-tag ${km.cls}">${esc(km.label)}</span>
+        <span class="sync-tag">${SYNC_ENTITY_LABEL[c.entity]}</span>
+        <b>${target}</b>
+        <span class="ci-time">${fmtTime(c.detected_at)}</span>
+      </div>
+      ${c.status === "pending"
+        ? `<div class="ci-actions"><button class="btn primary small" data-cid="${c.id}">查看差异并裁决</button></div>`
+        : `<div class="ci-resolved">已裁决：<b>${esc(syncResolutionLabel(c.kind, c.resolution))}</b>
+             · ${esc(c.decided_by_name || "系统")} · ${fmtTime(c.decided_at)}
+             ${c.decision_note ? ` · ${esc(c.decision_note)}` : ""}
+             <button class="btn small" data-cid="${c.id}" style="margin-left:8px">查看</button></div>`}
+    </div>`;
+  }).join("");
+  $$("[data-cid]", box).forEach((b) => {
+    b.onclick = () => openSyncConflictModal(rows.find((x) => String(x.id) === b.dataset.cid),
+      () => { renderSyncCenter(); });
+  });
+}
+
+function syncResolutionLabel(kind, res) {
+  return {
+    both_changed: { take_upstream: "采用上游值", keep_local: "保留本地值" },
+    upstream_deleted: { delete_local: "跟随上游删除", keep_local: "保留本地" },
+    local_deleted: { resurrect: "按上游恢复", keep_deleted: "维持删除", reappeared: "上游恢复，自动还原" },
+  }[kind]?.[res] || res;
+}
+
+async function loadRuns() {
+  const box = $("#sy-runs");
+  let rows;
+  try {
+    rows = await api("/api/sync/runs?limit=15");
+  } catch (e) { box.innerHTML = `<div class="empty-tip">${esc(e.message)}</div>`; return; }
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty-tip">还没有同步趟次</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="run-list">${rows.map((r) => {
+    const t = r.totals || {};
+    return `<div class="run-row" data-rid="${r.id}">
+      <div class="rr-top">
+        <span class="run-status ${esc(r.status)}">${esc(r.status_label)}</span>
+        <b>#${r.id}</b>
+        <span class="rr-who">${esc(r.triggered_by_name)} · ${fmtTime(r.started_at)}</span>
+        <span class="rr-dur">${fmtDuration(r.duration_ms)}</span>
+      </div>
+      <div class="rr-nums">
+        <span>接收 ${t.received || 0}</span>
+        <span class="n-add">新增 ${t.created || 0}</span>
+        <span class="n-upd">改动 ${t.updated || 0}</span>
+        <span class="n-inv">未通过 ${t.invalid || 0}</span>
+        ${(t.conflicts + t.upstream_deleted + t.local_deleted)
+          ? `<span class="n-conf">待裁决 ${(t.conflicts || 0) + (t.upstream_deleted || 0) + (t.local_deleted || 0)}</span>` : ""}
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+  $$(".run-row", box).forEach((el) => {
+    el.onclick = () => openSyncRunModal(el.dataset.rid, renderSyncCenter);
+  });
+}
+
+/* ---------------- 同步冲突裁决弹窗 ---------------- */
+
+function syncFieldRowsHtml(c) {
+  const rows = c.field_rows || c.upstream_changes || [];
+  if (!rows.length) return `<div class="empty-tip">无字段差异</div>`;
+  const isBoth = c.kind === "both_changed";
+  const head = isBoth
+    ? `<tr><th>字段</th><th>同步基线（上次一致值）</th><th>本地现值</th><th>上游新值</th></tr>`
+    : `<tr><th>字段</th><th>${c.kind === "local_deleted" ? "上游仍在推送的值" : "本地记录内容"}</th></tr>`;
+  return `<table class="env-table diff-table sync-diff-table">
+    <thead>${head}</thead>
+    <tbody>
+      ${rows.map((d) => isBoth ? `
+        <tr class="${d.local_raw !== d.upstream_raw ? "changed" : ""}">
+          <td>${esc(d.label)}</td>
+          <td class="mono">${d.baseline == null ? '<span class="diff-gone">—</span>' : esc(d.baseline)}</td>
+          <td class="mono">${d.local == null ? '<span class="diff-gone">—</span>' : esc(d.local)}</td>
+          <td class="mono">${d.upstream == null ? '<span class="diff-gone">—</span>' : esc(d.upstream)}</td>
+        </tr>` : `
+        <tr><td>${esc(d.label)}</td>
+          <td class="mono">${c.kind === "local_deleted"
+            ? (d.local_raw == null ? "—" : esc(d.local))
+            : (d.local == null ? "—" : esc(d.local))}</td></tr>`).join("")}
+    </tbody>
+  </table>`;
+}
+
+function openSyncConflictModal(c, onResolved) {
+  const root = $("#modal-root");
+  const readOnly = c.status !== "pending";
+  const km = SYNC_KIND_META[c.kind];
+  let mountHtml = "";
+  let canDeleteLocal = true;
+  if (c.kind === "upstream_deleted") {
+    if (c.entity === "app" && c.delete_mounts) {
+      const m = c.delete_mounts;
+      mountHtml = `<div class="conflict-hint">跟随删除将级联清除：
+        环境 ${m.environments} 个、模块 ${m.modules} 个、配置项 ${m.config_items} 个、
+        配置版本 ${m.config_versions} 个、实例 ${m.instances} 个。</div>`;
+    } else if (c.entity === "env" && c.delete_blockers && c.delete_blockers.length) {
+      canDeleteLocal = false;
+      mountHtml = `<div class="conflict-hint">该环境还不能删除：${c.delete_blockers.map(esc).join("；")}。
+        请先解除挂载，再回来选择「跟随上游删除」。</div>`;
+    }
+  }
+  const kindIntro = {
+    both_changed: "本地这段时间有人改过这条，上游这一趟也推了新值。系统没有让任何一边覆盖另一边，请逐字段看清差异后决定整单留哪边；决定会连同你的身份记入留痕。",
+    upstream_deleted: "上游已经删除了这条记录，本地目前仍保留。你可以选择跟随上游删除（级联清理并说明影响），或保留本地（该删除标记不再打扰；若上游日后恢复，记录会自动还原）。",
+    local_deleted: "这条记录本地此前已经删除，但上游仍在推送。系统不会让它偷偷复活成新记录：你可以按上游数据恢复，或维持本地删除（以后忽略该源记录）。",
+  }[c.kind];
+
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:820px">
+      <h3>⚖️ 同步差异裁决
+        <span class="sync-tag ${km.cls}" style="margin-left:6px">${esc(km.label)}</span>
+        <span class="sync-tag">${SYNC_ENTITY_LABEL[c.entity]}</span>
+      </h3>
+      <div class="conflict-meta">
+        <b>${esc(c.entity === "app" ? (c.name || c.app_name) : `${c.parent_name || c.app_name} / ${c.name}`)}</b>
+        · ${fmtTime(c.detected_at)} 由同步趟次 #${c.run_id || "—"} 发现
+      </div>
+      <p style="font-size:13px;color:var(--ink-2);margin:0 0 10px">${esc(kindIntro)}</p>
+      ${mountHtml}
+      ${syncFieldRowsHtml(c)}
+      ${readOnly ? `
+        <div class="conflict-meta" style="margin-top:12px">
+          裁决结果：<b>${esc(syncResolutionLabel(c.kind, c.resolution))}</b>
+          · 裁决人 ${esc(c.decided_by_name || "系统")} · ${fmtTime(c.decided_at)}
+          ${c.decision_note ? `<br>备注：${esc(c.decision_note)}` : ""}
+        </div>` : `
+        <div style="margin-top:10px">
+          <label style="font-size:12px;color:var(--ink-2)">裁决备注（可选，会写入留痕）</label>
+          <input id="cf-sync-note" class="sync-note-input" maxlength="200" placeholder="如：与上游负责人确认 / 本地值为线上热修，稍后回灌上游">
+        </div>`}
+      <div class="form-error" id="cf-sync-error"></div>
+      <div class="form-actions">
+        <button class="btn" id="cf-sync-cancel">${readOnly ? "关闭" : "取消"}</button>
+        ${readOnly ? "" : conflictActionButtons(c, canDeleteLocal)}
+      </div>
+    </div></div>`;
+
+  const close = () => { root.innerHTML = ""; };
+  $("#cf-sync-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  if (readOnly) return;
+  $$("[data-decision]", root).forEach((b) => {
+    b.onclick = () => submitDecision(c.id, b.dataset.decision, b.dataset.confirm === "1", close, onResolved);
+  });
+}
+
+function conflictActionButtons(c, canDeleteLocal) {
+  if (c.kind === "both_changed") {
+    return `<button class="btn" data-decision="keep_local">保留本地值</button>
+            <button class="btn primary" data-decision="take_upstream">采用上游值</button>`;
+  }
+  if (c.kind === "upstream_deleted") {
+    return `<button class="btn" data-decision="keep_local">保留本地</button>
+            <button class="btn danger" data-decision="delete_local" data-confirm="1" ${canDeleteLocal ? "" : "disabled"}>
+              ${canDeleteLocal ? "跟随上游删除（确认影响后执行）" : "跟随上游删除（有挂载未解除）"}
+            </button>`;
+  }
+  return `<button class="btn" data-decision="keep_deleted">维持本地删除并忽略</button>
+          <button class="btn primary" data-decision="resurrect">按上游数据恢复</button>`;
+}
+
+async function submitDecision(cid, resolution, needConfirm, close, onResolved) {
+  const note = $("#cf-sync-note").value.trim();
+  if (needConfirm && !confirm("确认执行删除？应用下的环境、模块、配置与实例会被级联清除，且该决定记入留痕。")) return;
+  const box = $("#cf-sync-error");
+  try {
+    await api(`/api/sync/conflicts/${cid}/decide`, { method: "POST", body: { resolution, note } });
+    toast("裁决已提交并留痕", "success");
+    close();
+    if (onResolved) onResolved();
+  } catch (e) {
+    box.textContent = e.message;
+    box.classList.add("show");
+  }
+}
+
+/* ---------------- 同步趟次明细弹窗 ---------------- */
+
+const SYNC_ITEM_FILTERS = [
+  ["all", "全部"], ["created", "新增"], ["updated", "改动"], ["invalid", "未通过"],
+  ["conflict", "双方同改"], ["upstream_deleted", "上游删除"], ["local_deleted", "本地已删"],
+  ["unchanged", "无变化"], ["ignored", "跳过"],
+];
+
+async function openSyncRunModal(runId, onClose) {
+  let run;
+  try {
+    run = await api(`/api/sync/runs/${runId}`);
+  } catch (e) { toast(e.message, "error"); return; }
+  const root = $("#modal-root");
+  const t = run.totals || {};
+  let filter = "all";
+  const paint = () => {
+    const items = filter === "all" ? run.items : run.items.filter((i) => i.result === filter);
+    root.innerHTML = `
+      <div class="modal-mask"><div class="modal" style="width:900px">
+        <h3>同步趟次 #${run.id}
+          <span class="run-status ${esc(run.status)}" style="margin-left:6px">${esc(run.status_label)}</span>
+        </h3>
+        <div class="conflict-meta">
+          ${esc(run.trigger_label)} · 触发人 <b>${esc(run.triggered_by_name)}</b>
+          · ${fmtTime(run.started_at)}${run.finished_at ? ` – ${fmtTime(run.finished_at)}` : ""}
+          · 耗时 <b>${fmtDuration(run.duration_ms)}</b>
+        </div>
+        ${run.error ? `<div class="conflict-hint">整趟异常：${esc(run.error)}</div>` : ""}
+        <div class="diff-summary">
+          <span class="ds">接收 ${t.received || 0}</span>
+          <span class="ds onlyb">新增 ${t.created || 0}</span>
+          <span class="ds changed">改动 ${t.updated || 0}</span>
+          <span class="ds onlya">双方同改 ${t.conflicts || 0}</span>
+          <span class="ds onlya">上游删除 ${t.upstream_deleted || 0}</span>
+          <span class="ds onlya">本地已删 ${t.local_deleted || 0}</span>
+          <span class="ds changed">未通过 ${t.invalid || 0}</span>
+          <span class="ds same">无变化 ${t.unchanged || 0}</span>
+          <span class="ds same">跳过 ${t.ignored || 0}</span>
+        </div>
+        <div class="admin-tabs">
+          ${SYNC_ITEM_FILTERS.map(([k, label]) =>
+            `<button class="adm-tab ${filter === k ? "active" : ""}" data-f="${k}">${label}</button>`).join("")}
+        </div>
+        <div class="sync-items-wrap">
+          ${items.length ? `<table class="app-table sync-items-table">
+            <thead><tr><th>对象</th><th>名称</th><th>所属应用</th><th>结果</th><th>说明 / 卡在哪</th></tr></thead>
+            <tbody>
+              ${items.map((i) => `
+                <tr class="item-row item-${esc(i.result)}">
+                  <td><span class="sync-tag">${SYNC_ENTITY_LABEL[i.entity]}</span></td>
+                  <td class="app-name-cell">${esc(i.name || "—")}
+                    ${i.changes && i.changes.length ? `<div class="app-desc">
+                      ${i.changes.map((ch) => `${esc(ch.label)}: ${ch.baseline == null ? "（空）" : esc(ch.baseline)} → ${ch.upstream == null ? "（空）" : esc(ch.upstream)}`).join("；")}
+                    </div>` : ""}</td>
+                  <td>${esc(i.parent_name || "—")}</td>
+                  <td><span class="sync-tag ${SYNC_RESULT_META[i.result].cls}">${esc(i.result_label)}</span></td>
+                  <td class="reason-cell">${esc(i.reason || "—")}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>` : `<div class="empty-tip">该分类下没有记录</div>`}
+        </div>
+        <div class="form-actions"><button class="btn primary" id="sr-close">关闭</button></div>
+      </div></div>`;
+    $("#sr-close").onclick = () => { root.innerHTML = ""; if (onClose) onClose(); };
+    $(".modal-mask", root).onclick = (e) => {
+      if (e.target.classList.contains("modal-mask")) { root.innerHTML = ""; if (onClose) onClose(); }
+    };
+    $$("[data-f]", root).forEach((b) => {
+      b.onclick = () => { filter = b.dataset.f; paint(); };
+    });
+  };
+  paint();
+}
+
+/* ---------------- 应用模块管理 ---------------- */
+
+async function renderAppModules(app) {
+  const box = $("#app-modules");
+  if (!box) return;
+  const canManage = app.can_manage && app.status !== "offline";
+  let mods;
+  try {
+    mods = await api(`/api/apps/${app.id}/modules`);
+  } catch (e) {
+    box.innerHTML = `<div class="empty-tip">模块加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <h3>应用模块 <span style="color:var(--ink-3);font-weight:400;font-size:12px">（${mods.length} 个，本地与上游同步纳管）</span></h3>
+    ${canManage ? '<div style="margin-bottom:10px"><button class="btn small primary" id="mod-add">+ 新增模块</button></div>' : ""}
+    ${mods.length ? `<div class="table-wrap"><table class="app-table">
+      <thead><tr><th>模块</th><th>类型</th><th>版本</th><th>状态</th><th>来源</th><th style="width:110px"></th></tr></thead>
+      <tbody>
+        ${mods.map((m) => `
+          <tr>
+            <td class="app-name-cell">${esc(m.name)}
+              ${m.source_deleted ? '<br><span class="sync-tag updel">上游已删除，待裁决</span>' : ""}
+              <div class="app-desc">${esc(m.description || "")}</div></td>
+            <td>${esc(m.module_type_label)}</td>
+            <td class="mono">${esc(m.version_tag || "—")}</td>
+            <td>${esc(m.status_label)}</td>
+            <td>${m.from_upstream ? '<span class="sync-tag same">上游同步</span>' : '<span class="sync-tag">本地登记</span>'}</td>
+            <td>${canManage ? `
+              <button class="btn small" data-edit="${m.id}">编辑</button>
+              <button class="btn small danger" data-del="${m.id}">删除</button>` : "—"}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table></div>` : `<div class="empty-tip">还没有模块，${canManage ? "点「新增模块」登记第一个" : ""}</div>`}`;
+  const addBtn = $("#mod-add", box);
+  if (addBtn) addBtn.onclick = () => openModuleModal(app, null, mods, () => renderAppDetail(app.id));
+  $$("[data-edit]", box).forEach((b) => {
+    b.onclick = () => openModuleModal(app, mods.find((x) => String(x.id) === b.dataset.edit), mods,
+      () => renderAppDetail(app.id));
+  });
+  $$("[data-del]", box).forEach((b) => {
+    b.onclick = async () => {
+      const m = mods.find((x) => String(x.id) === b.dataset.del);
+      if (!confirm(`确认删除模块「${m.name}」？${m.from_upstream ? "若上游仍在推送，将进入「本地已删」待裁决，不会偷偷复活。" : ""}`)) return;
+      try {
+        await api(`/api/apps/${app.id}/modules/${m.id}`, { method: "DELETE" });
+        toast("模块已删除", "success");
+        renderAppDetail(app.id);
+      } catch (e) { toast(e.message, "error"); }
+    };
+  });
+}
+
+function openModuleModal(app, mod, mods, onSaved) {
+  const root = $("#modal-root");
+  const isEdit = !!mod;
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:560px">
+      <h3>${isEdit ? "编辑模块" : "新增模块"}</h3>
+      <div class="form-grid">
+        <div class="full"><label>模块名</label><input id="mf-name" value="${esc(mod ? mod.name : "")}" maxlength="64"></div>
+        <div><label>类型</label><select id="mf-type">
+          ${[["service", "后端服务"], ["web", "前端应用"], ["job", "定时任务"], ["middleware", "中间件"], ["database", "数据存储"]]
+            .map(([v, l]) => `<option value="${v}" ${mod && mod.module_type === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select></div>
+        <div><label>版本标签</label><input id="mf-ver" value="${esc(mod ? mod.version_tag : "")}" placeholder="如 v1.2.0"></div>
+        <div><label>状态</label><select id="mf-status">
+          ${[["active", "运行中"], ["deprecated", "已废弃"], ["stopped", "已停用"]]
+            .map(([v, l]) => `<option value="${v}" ${mod && mod.status === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select></div>
+        <div></div>
+        <div class="full"><label>说明</label><textarea id="mf-desc" rows="3">${esc(mod ? mod.description : "")}</textarea></div>
+      </div>
+      ${isEdit && mod.from_upstream ? `<p class="field-hint">该模块由上游同步纳管：本地改动会进入三方比对，上游同趟也改过时不会被静默覆盖。</p>` : ""}
+      <div class="form-error" id="mf-error"></div>
+      <div class="form-actions">
+        <button class="btn" id="mf-cancel">取消</button>
+        <button class="btn primary" id="mf-save">${isEdit ? "保存" : "新增"}</button>
+      </div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#mf-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  $("#mf-save").onclick = async () => {
+    const body = {
+      name: $("#mf-name").value.trim(),
+      module_type: $("#mf-type").value,
+      version_tag: $("#mf-ver").value.trim(),
+      status: $("#mf-status").value,
+      description: $("#mf-desc").value.trim(),
+    };
+    const box = $("#mf-error");
+    try {
+      if (isEdit) await api(`/api/apps/${app.id}/modules/${mod.id}`, { method: "PUT", body });
+      else await api(`/api/apps/${app.id}/modules`, { method: "POST", body });
+      toast(isEdit ? "模块已保存" : "模块已新增", "success");
+      close();
+      onSaved && onSaved();
+    } catch (e) {
+      box.textContent = e.message;
+      box.classList.add("show");
+    }
+  };
+}
+
+/* ---------------- 删除应用（本地删除 → 墓碑 → 上游再推不复活） ---------------- */
+
+function openDeleteAppModal(app) {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask"><div class="modal" style="width:560px">
+      <h3>删除应用「${esc(app.name)}」</h3>
+      <p style="font-size:13px;color:var(--ink-2)">删除会级联清除其环境、模块、配置、版本、实例与留痕归属。
+        若上游仍在推送该应用，它<b>不会被偷偷复活</b>，而是进入「本地已删」待裁决，由你决定是否恢复。</p>
+      <div class="form-actions">
+        <button class="btn" id="da-cancel">取消</button>
+        <button class="btn danger" id="da-check">查看将删除的内容</button>
+      </div>
+      <div class="form-error" id="da-error"></div>
+      <div id="da-mounts"></div>
+    </div></div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#da-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  $("#da-check").onclick = async () => {
+    try {
+      // 第一次提交：后端返回 409 + 挂载清单（不删除）
+      await api(`/api/apps/${app.id}`, { method: "DELETE", body: { confirm: false } });
+    } catch (e) {
+      if (e.status === 409 && e.payload && e.payload.mounts) {
+        const m = e.payload.mounts;
+        $("#da-mounts").innerHTML = `
+          <div class="conflict-hint">将删除：环境 ${m.environments} 个、模块 ${m.modules} 个、
+            配置项 ${m.config_items} 个、历史版本 ${m.config_versions} 个、实例 ${m.instances} 个。</div>
+          <div class="form-actions">
+            <button class="btn" id="da-back">再想想</button>
+            <button class="btn danger" id="da-confirm">确认删除全部</button>
+          </div>`;
+        $("#da-back").onclick = close;
+        $("#da-confirm").onclick = async () => {
+          try {
+            await api(`/api/apps/${app.id}`, { method: "DELETE",
+              body: { confirm: true, note: "台账中手动删除" } });
+            toast("应用已删除；上游再推时将进入待裁决，不会自动复活", "success");
+            close();
+            location.hash = "#/apps";
+          } catch (e2) {
+            const box = $("#da-error");
+            box.textContent = e2.message; box.classList.add("show");
+          }
+        };
+        return;
+      }
+      const box = $("#da-error");
+      box.textContent = e.message; box.classList.add("show");
+    }
+  };
 }
 
 /* ---------------- 错误态 ---------------- */

@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS change_logs (
 CREATE TABLE IF NOT EXISTS config_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     app_id      INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
-    environment TEXT NOT NULL CHECK (environment IN ('dev','test','staging','prod')),
+    environment TEXT NOT NULL,   -- 键不写死枚举：自定义环境（如 gray）也允许，由服务端按注册表校验
     key         TEXT NOT NULL,
     value       TEXT NOT NULL DEFAULT '',   -- 密文同样落库（内部系统演示，无外部 KMS），接口默认不回传明文
     value_type  TEXT NOT NULL DEFAULT 'string'
@@ -293,6 +293,151 @@ CREATE INDEX IF NOT EXISTS idx_iev_app_time ON instance_events(app_id, created_a
 CREATE INDEX IF NOT EXISTS idx_opsaudit_app ON ops_audit_logs(app_id);
 CREATE INDEX IF NOT EXISTS idx_opsaudit_time ON ops_audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_opsaudit_cat ON ops_audit_logs(category);
+
+-- ====================================================================
+-- 上游数据同步（应用 / 环境 / 模块）
+-- ====================================================================
+-- 同步设计要点：
+-- 1. 每条本地记录记住上游 source_id 与"上次同步成功时的字段快照" sync_baseline_json，
+--    同步时做 基线 vs 本地 vs 上游 三方比对：本地相对基线改过、上游也改过 = 双方同改，
+--    挂起等人裁决，绝不后来者静默覆盖；keep_local 裁决用 sync_upstream_ack_json 记住
+--    被驳回的上游值，同一上游值下一轮不会又被自动写回。
+-- 2. source_deleted=1 表示上游已删、本地仍保留待裁决（列表继续可见但带明确标记）。
+-- 3. 本地删除过的上游记录写 sync_tombstones：上游再推来时不偷偷复活，进入待决队列。
+
+-- 同步调度设置（单行 id=1）
+CREATE TABLE IF NOT EXISTS sync_settings (
+    id               INTEGER PRIMARY KEY CHECK (id=1),
+    enabled          INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    interval_seconds INTEGER NOT NULL DEFAULT 300,
+    updated_by       INTEGER REFERENCES users(id),
+    updated_at       INTEGER NOT NULL
+);
+
+-- 同步子系统的通用键值（当前只用 scenario_stage：模拟源演到第几幕）
+CREATE TABLE IF NOT EXISTS sync_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+
+-- 模拟上游"推送"过来的数据（演示环境不连真云，上游快照就落在这张表）：
+-- entity=app/env/module；is_deleted=1 表示上游在这一趟明确删除了该对象
+CREATE TABLE IF NOT EXISTS sync_source_data (
+    entity             TEXT NOT NULL CHECK (entity IN ('app','env','module')),
+    source_id          TEXT NOT NULL,
+    parent_source_id   TEXT NOT NULL DEFAULT '',   -- env/module 所属应用的 source_id
+    name               TEXT NOT NULL DEFAULT '',
+    payload            TEXT NOT NULL DEFAULT '{}',
+    is_deleted         INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0,1)),
+    upstream_updated_at INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (entity, source_id)
+);
+
+-- 本地删除墓碑：记录"这条上游数据本地已经删过"，防止上游再推时复活成新记录。
+-- resolution='' 表示存在待决冲突；'ignored' 表示人工明确决定"不恢复，以后也忽略"。
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+    entity           TEXT NOT NULL,
+    source_id        TEXT NOT NULL,
+    parent_source_id TEXT NOT NULL DEFAULT '',
+    name             TEXT NOT NULL DEFAULT '',
+    deleted_by       INTEGER REFERENCES users(id),
+    deleted_at       INTEGER NOT NULL,
+    resolution       TEXT NOT NULL DEFAULT '',
+    decided_by       INTEGER REFERENCES users(id),
+    decided_at       INTEGER,
+    PRIMARY KEY (entity, source_id)
+);
+
+-- 每一趟同步
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual','scheduled')),
+    triggered_by INTEGER REFERENCES users(id),   -- 定时调度为 NULL
+    started_at   INTEGER NOT NULL,
+    finished_at  INTEGER,
+    duration_ms  INTEGER,
+    -- running / success（全自动落地）/ partial（有挂起或未通过）/ failed（整趟异常）
+    status       TEXT NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('running','success','partial','failed')),
+    totals_json  TEXT NOT NULL DEFAULT '{}',
+    error        TEXT NOT NULL DEFAULT ''
+);
+
+-- 一趟内每个对象的处理结果（新增/改动/未通过原因/挂起类别等）
+CREATE TABLE IF NOT EXISTS sync_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    entity      TEXT NOT NULL,
+    source_id   TEXT NOT NULL DEFAULT '',
+    local_id    INTEGER,
+    name        TEXT NOT NULL DEFAULT '',
+    parent_name TEXT NOT NULL DEFAULT '',
+    -- created/updated/unchanged/conflict/upstream_deleted/local_deleted/invalid/ignored
+    result      TEXT NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    changes_json TEXT NOT NULL DEFAULT '[]',
+    created_at  INTEGER NOT NULL
+);
+
+-- 待裁决/已裁决的差异：双方同改 / 上游删除 / 本地已删上游又推
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- both_changed 双方同改 / upstream_deleted 上游删除 / local_deleted 本地已删上游又推
+    kind        TEXT NOT NULL CHECK (kind IN ('both_changed','upstream_deleted','local_deleted')),
+    entity      TEXT NOT NULL CHECK (entity IN ('app','env','module')),
+    source_id   TEXT NOT NULL,
+    parent_source_id TEXT NOT NULL DEFAULT '',
+    local_id    INTEGER,
+    app_id      INTEGER,
+    run_id      INTEGER REFERENCES sync_runs(id) ON DELETE SET NULL,
+    detected_at INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','resolved')),
+    baseline_json   TEXT NOT NULL DEFAULT '{}',
+    local_json      TEXT NOT NULL DEFAULT '{}',
+    upstream_json   TEXT NOT NULL DEFAULT '{}',
+    local_changed_json    TEXT NOT NULL DEFAULT '[]',
+    upstream_changed_json TEXT NOT NULL DEFAULT '[]',
+    -- keep_local/take_upstream（双方同改）；keep_local/delete_local（上游删除）；
+    -- resurrect/keep_deleted（本地已删上游又推）
+    resolution  TEXT NOT NULL DEFAULT '',
+    decided_by  INTEGER REFERENCES users(id),
+    decided_at  INTEGER,
+    decision_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sruns_started ON sync_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_sitems_run ON sync_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_sitems_result ON sync_items(result);
+CREATE INDEX IF NOT EXISTS idx_sconf_status ON sync_conflicts(status);
+CREATE INDEX IF NOT EXISTS idx_sconf_app ON sync_conflicts(app_id);
+-- 同一对象只允许挂一个待决冲突；已裁决行不占唯一位
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sconf_pending
+    ON sync_conflicts(entity, source_id) WHERE status='pending';
+-- 注：applications.source_id / app_environments.source_id 的唯一索引在
+-- _migrate_sync_columns() 中创建——旧库要先 ALTER 补列才能建索引，
+-- 放在 SCHEMA 里会让旧库启动即失败。
+
+-- 应用模块（本地可建，也可由上游同步）
+CREATE TABLE IF NOT EXISTS app_modules (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id         INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    source_id      TEXT,
+    source_deleted INTEGER NOT NULL DEFAULT 0 CHECK (source_deleted IN (0,1)),
+    sync_baseline_json TEXT NOT NULL DEFAULT '{}',
+    sync_upstream_ack_json TEXT NOT NULL DEFAULT '{}',
+    name           TEXT NOT NULL,
+    module_type    TEXT NOT NULL DEFAULT 'service',
+    version_tag    TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'active',
+    description    TEXT NOT NULL DEFAULT '',
+    created_by     INTEGER REFERENCES users(id),
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    UNIQUE (app_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_modules_app ON app_modules(app_id);
+CREATE INDEX IF NOT EXISTS idx_modules_src ON app_modules(source_id);
+CREATE INDEX IF NOT EXISTS idx_tomb_entity ON sync_tombstones(entity, source_id);
 """
 
 _local = threading.local()
@@ -314,8 +459,13 @@ def init_db() -> None:
     conn.executescript(SCHEMA)
     _migrate_legacy(conn)
     _migrate_env_checks(conn)
+    _migrate_sync_columns(conn)
     _backfill_app_environments(conn)
     _repair_audit_environment(conn)
+    conn.commit()
+    # 迁移过程中可能临时 PRAGMA foreign_keys=OFF（重建表需要），结束后必须恢复；
+    # 该 PRAGMA 只能在无事务时设置，commit 之后执行
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.commit()
 
 
@@ -477,6 +627,31 @@ def _repair_audit_environment(conn) -> None:
                SELECT v.environment FROM config_versions v
                WHERE v.id = config_audit_logs.version_id)"""
     )
+
+
+def _migrate_sync_columns(conn) -> None:
+    """旧库补同步列：source_id / source_deleted / 基线快照 / 驳回值快照。
+
+    ALTER TABLE ADD COLUMN 不允许带 UNIQUE 约束，source_id 的唯一性改由
+    部分唯一索引保证（NULL = 纯本地记录，不参与同步）。
+    """
+    sync_cols = [
+        ("source_id", "TEXT"),
+        ("source_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("sync_baseline_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("sync_upstream_ack_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ]
+    for table in ("applications", "app_environments"):
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in sync_cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_source_id "
+        "ON applications(source_id) WHERE source_id IS NOT NULL")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_appenv_source_id "
+        "ON app_environments(source_id) WHERE source_id IS NOT NULL")
 
 
 def _migrate_legacy(conn) -> None:
