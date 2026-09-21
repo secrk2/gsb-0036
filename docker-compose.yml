@@ -1,0 +1,14 @@
+services:
+  zhiyun:
+    build: .
+    container_name: zhiyun
+    ports:
+      - "8016:8016"
+    environment:
+      - DB_PATH=/data/zhiyun.db
+    volumes:
+      - zhiyun-data:/data
+    restart: unless-stopped
+
+volumes:
+  zhiyun-data:

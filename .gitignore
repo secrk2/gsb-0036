@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+target/
+.turbo/
+.venv/
+venv/
+__pycache__/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store

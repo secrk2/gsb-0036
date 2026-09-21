@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>织云系统 · 应用台账与资产控制台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-logo">织</span>
+      <span class="brand-name">织云系统</span>
+    </div>
+    <nav class="topnav" id="topnav" hidden>
+      <a href="#/console" data-route="console">资产控制台</a>
+      <a href="#/apps" data-route="apps">应用台账</a>
+      <a href="#/health" data-route="health">应用健康</a>
+      <a href="#/config" data-route="config">配置档案</a>
+      <a href="#/audit" data-route="audit">变更留痕</a>
+      <a href="#/admin" data-route="admin">权限与交接</a>
+    </nav>
+    <div class="user-chip" id="user-chip" hidden></div>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <!-- 登录遮罩 -->
+  <div class="login-overlay" id="login-overlay" hidden>
+    <div class="login-panel">
+      <div class="login-brand"><span class="brand-logo large">织</span></div>
+      <h1>织云系统</h1>
+      <p class="login-sub">应用台账 · 资产控制台 —— 请选择账号登录（内部演示环境）</p>
+      <div class="login-users" id="login-users"></div>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
